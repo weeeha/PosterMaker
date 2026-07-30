@@ -1,10 +1,12 @@
 import { createUIMessageStream, type UIMessageStreamWriter } from "ai";
 import { nanoid } from "nanoid";
-import { planPoster, type PosterPlan } from "./planner";
+import { planArt, planDocument, type ArtPlan, type DocumentPlan, type StyleGuide } from "./planner";
 import { generateAssets } from "./asset-gen";
+import { imageSizeForAspect } from "./gateway";
 import { readProject, writeProject } from "../poster/storage";
-import type { PosterUIMessage } from "./messages";
-import type { Asset, Block, Layout, PosterProject } from "../poster/types";
+import { mediaAspectValue, mediaOrDefault } from "../poster/media";
+import type { PlanSummary, PosterUIMessage } from "./messages";
+import type { Asset, Block, Canvas, PosterProject, TextBlock } from "../poster/types";
 
 export function createOrchestrationStream(args: {
   projectId: string;
@@ -24,6 +26,13 @@ export function createOrchestrationStream(args: {
   });
 }
 
+interface Ctx {
+  project: PosterProject;
+  userMessage: string;
+  writer: UIMessageStreamWriter<PosterUIMessage>;
+  signal?: AbortSignal;
+}
+
 async function runOrchestration({
   projectId,
   userMessage,
@@ -38,40 +47,151 @@ async function runOrchestration({
   const project = await readProject(projectId);
   if (!project) throw new Error(`Project ${projectId} not found`);
 
-  const ts = new Date().toISOString();
   project.brief.prompt = userMessage;
-  project.brief.history.push({ role: "user", content: userMessage, ts });
-
-  writer.write({
-    type: "data-status",
-    id: "status",
-    data: { phase: "planning", note: "Designing layout…" },
+  project.brief.history.push({
+    role: "user",
+    content: userMessage,
+    ts: new Date().toISOString(),
   });
 
-  const historyBeforeThisTurn = project.brief.history.slice(0, -1);
+  const ctx: Ctx = { project, userMessage, writer, signal };
 
-  const plan = await planPoster({
+  // The two intents are genuinely different pipelines, not one pipeline with a
+  // different prompt: art mode generates a single sheet-filling image and
+  // synthesises its own layout, document mode lays out type and may skip images.
+  const updated =
+    project.brief.intent === "art" ? await runArt(ctx) : await runDocument(ctx);
+
+  status(writer, "saving", "Saving project…");
+  await writeProject(updated);
+
+  writer.write({
+    type: "data-layout",
+    id: "layout",
+    data: { layout: updated.layout, canvas: updated.canvas, title: updated.title },
+  });
+  status(writer, "done");
+}
+
+/* ------------------------------------------------------------------ art ---- */
+
+async function runArt({ project, userMessage, writer, signal }: Ctx): Promise<PosterProject> {
+  status(writer, "planning", "Art-directing the piece…");
+
+  const plan = await planArt({
     canvas: project.canvas,
     brief: userMessage,
-    history: historyBeforeThisTurn.map((t) => ({ role: t.role, content: t.content })),
+    history: historyBefore(project),
   });
 
-  writer.write({ type: "data-plan", id: "plan", data: { plan } });
-
-  const totalAssets = plan.assetsToGenerate.length;
   writer.write({
-    type: "data-status",
-    id: "status",
-    data: {
-      phase: "generating-assets",
-      note: totalAssets === 0 ? "No illustrations needed." : `Generating ${totalAssets} illustration${totalAssets === 1 ? "" : "s"}…`,
+    type: "data-plan",
+    id: "plan",
+    data: { plan: summarizeArt(plan) },
+  });
+
+  // Ask for the sheet's exact aspect at the largest size the model allows, so
+  // the artwork fills the page without cropping.
+  const media = mediaOrDefault(project.canvas.mediaId);
+  const aspect = mediaAspectValue(media, project.canvas.orientation);
+  const size = imageSizeForAspect(aspect);
+
+  status(
+    writer,
+    "generating-assets",
+    `Generating artwork at ${size.width}×${size.height}…`,
+  );
+  writer.write({
+    type: "data-progress",
+    id: "progress",
+    data: { current: 0, total: 1, label: "Artwork" },
+  });
+
+  const generated = await generateAssets({
+    projectId: project.id,
+    specs: [{ role: "artwork", prompt: plan.imagePrompt, size }],
+    signal,
+    onAsset: ({ asset, role }) => {
+      writer.write({ type: "data-asset", id: `asset-${asset.id}`, data: { role, asset } });
+      writer.write({
+        type: "data-progress",
+        id: "progress",
+        data: { current: 1, total: 1, label: "Artwork" },
+      });
     },
   });
-  if (totalAssets > 0) {
+
+  status(writer, "composing", "Composing sheet…");
+
+  const artwork = generated[0]?.asset;
+  const blocks: Block[] = [];
+
+  if (artwork) {
+    // The artwork covers the whole sheet. `cover` rather than `contain` because
+    // the requested aspect already matches the page; cover only bites if the
+    // provider quantised the dimensions slightly.
+    blocks.push({
+      id: nanoid(8),
+      kind: "image",
+      x: 0,
+      y: 0,
+      w: 1,
+      h: 1,
+      z: 0,
+      assetId: artwork.id,
+      fit: "cover",
+    });
+  }
+
+  blocks.push(...plan.overlay.map((b, i) => toTextBlock(b, i + 1)));
+
+  return {
+    ...project,
+    title: plan.title || project.title,
+    canvas: applyStyleGuide(project.canvas, plan.styleGuide),
+    assets: [...project.assets, ...(artwork ? [artwork] : [])],
+    layout: { blocks, layoutVersion: new Date().toISOString() },
+    brief: withAssistantTurn(
+      project,
+      plan.styleGuide.mood,
+      artwork
+        ? `Generated "${plan.title}" as a single ${artwork.widthPx}×${artwork.heightPx} artwork filling the sheet.`
+        : `Planned "${plan.title}", but artwork generation failed. Try again or adjust the brief.`,
+    ),
+  };
+}
+
+/* ------------------------------------------------------------- document ---- */
+
+async function runDocument({
+  project,
+  userMessage,
+  writer,
+  signal,
+}: Ctx): Promise<PosterProject> {
+  status(writer, "planning", "Designing layout…");
+
+  const plan = await planDocument({
+    canvas: project.canvas,
+    brief: userMessage,
+    history: historyBefore(project),
+  });
+
+  writer.write({ type: "data-plan", id: "plan", data: { plan: summarizeDocument(plan) } });
+
+  const total = plan.assetsToGenerate.length;
+  status(
+    writer,
+    "generating-assets",
+    total === 0
+      ? "No illustrations needed."
+      : `Generating ${total} illustration${total === 1 ? "" : "s"}…`,
+  );
+  if (total > 0) {
     writer.write({
       type: "data-progress",
       id: "progress",
-      data: { current: 0, total: totalAssets, label: "Illustrations" },
+      data: { current: 0, total, label: "Illustrations" },
     });
   }
 
@@ -79,7 +199,7 @@ async function runOrchestration({
   let completed = 0;
 
   await generateAssets({
-    projectId,
+    projectId: project.id,
     specs: plan.assetsToGenerate.map((a) => ({
       role: a.role,
       prompt: a.prompt,
@@ -89,103 +209,38 @@ async function runOrchestration({
     onAsset: ({ asset, role }) => {
       assetsByRole.set(role, asset);
       completed += 1;
-      writer.write({
-        type: "data-asset",
-        id: `asset-${asset.id}`,
-        data: { role, asset },
-      });
+      writer.write({ type: "data-asset", id: `asset-${asset.id}`, data: { role, asset } });
       writer.write({
         type: "data-progress",
         id: "progress",
-        data: { current: completed, total: totalAssets, label: "Illustrations" },
+        data: { current: completed, total, label: "Illustrations" },
       });
     },
   });
 
-  writer.write({
-    type: "data-status",
-    id: "status",
-    data: { phase: "composing", note: "Composing layout…" },
-  });
+  status(writer, "composing", "Composing layout…");
 
-  const layout: Layout = {
-    blocks: planBlocksToLayout(plan, assetsByRole),
-    layoutVersion: new Date().toISOString(),
-  };
+  const blocks = documentBlocks(plan, assetsByRole);
 
-  const updated: PosterProject = {
+  return {
     ...project,
     title: plan.title || project.title,
-    canvas: {
-      ...project.canvas,
-      background: { kind: "solid", color: plan.styleGuide.background },
-      palette: plan.styleGuide.palette,
-    },
+    canvas: applyStyleGuide(project.canvas, plan.styleGuide),
     assets: [...project.assets, ...assetsByRole.values()],
-    layout,
-    brief: {
-      ...project.brief,
-      styleNotes: plan.styleGuide.mood,
-      history: [
-        ...project.brief.history,
-        {
-          role: "assistant",
-          content: composeAssistantSummary(plan, totalAssets),
-          ts: new Date().toISOString(),
-        },
-      ],
-    },
+    layout: { blocks, layoutVersion: new Date().toISOString() },
+    brief: withAssistantTurn(
+      project,
+      plan.styleGuide.mood,
+      `Composed "${plan.title}" with ${blocks.length} block${blocks.length === 1 ? "" : "s"}` +
+        (total > 0 ? ` and ${total} illustration${total === 1 ? "" : "s"}.` : "."),
+    ),
   };
-
-  writer.write({
-    type: "data-status",
-    id: "status",
-    data: { phase: "saving", note: "Saving project…" },
-  });
-
-  await writeProject(updated);
-
-  writer.write({
-    type: "data-layout",
-    id: "layout",
-    data: {
-      layout,
-      palette: plan.styleGuide.palette,
-      background: plan.styleGuide.background,
-      title: updated.title,
-    },
-  });
-  writer.write({
-    type: "data-status",
-    id: "status",
-    data: { phase: "done" },
-  });
 }
 
-function planBlocksToLayout(
-  plan: PosterPlan,
-  assetsByRole: Map<string, Asset>,
-): Block[] {
+function documentBlocks(plan: DocumentPlan, assetsByRole: Map<string, Asset>): Block[] {
   return plan.blocks
     .map((b, idx): Block | null => {
-      if (b.kind === "text") {
-        return {
-          id: nanoid(8),
-          kind: "text",
-          x: b.x,
-          y: b.y,
-          w: b.w,
-          h: b.h,
-          z: idx,
-          text: b.text,
-          fontFamily: b.fontFamily,
-          fontSizePt: b.fontSizePt,
-          weight: b.weight,
-          color: b.color,
-          align: b.align,
-          lineHeight: b.lineHeight,
-        };
-      }
+      if (b.kind === "text") return toTextBlock(b, idx);
       if (b.kind === "shape") {
         return {
           id: nanoid(8),
@@ -218,12 +273,79 @@ function planBlocksToLayout(
     .filter((b): b is Block => b !== null);
 }
 
-function composeAssistantSummary(plan: PosterPlan, totalAssets: number) {
-  const blockCount = plan.blocks.length;
-  const parts = [
-    `Composed "${plan.title}" with ${blockCount} block${blockCount === 1 ? "" : "s"}`,
-  ];
-  if (totalAssets > 0) parts.push(`${totalAssets} illustration${totalAssets === 1 ? "" : "s"}`);
-  parts.push(`palette ${plan.styleGuide.palette.join(", ")}`);
-  return parts.join(". ") + ".";
+/* ---------------------------------------------------------------- shared --- */
+
+type PlannedText = Omit<TextBlock, "id" | "kind" | "z"> & { role?: string };
+
+function toTextBlock(b: PlannedText, z: number): TextBlock {
+  return {
+    id: nanoid(8),
+    kind: "text",
+    x: b.x,
+    y: b.y,
+    w: b.w,
+    h: b.h,
+    z,
+    text: b.text,
+    fontFamily: b.fontFamily,
+    fontSizePt: b.fontSizePt,
+    weight: b.weight,
+    color: b.color,
+    align: b.align,
+    lineHeight: b.lineHeight,
+  };
+}
+
+/** Style guide affects colors only — never the media size the user chose. */
+function applyStyleGuide(canvas: Canvas, style: StyleGuide): Canvas {
+  return {
+    ...canvas,
+    background: { kind: "solid", color: style.background },
+    palette: style.palette,
+  };
+}
+
+function historyBefore(project: PosterProject) {
+  return project.brief.history
+    .slice(0, -1)
+    .map((t) => ({ role: t.role, content: t.content }));
+}
+
+function withAssistantTurn(project: PosterProject, mood: string, content: string) {
+  return {
+    ...project.brief,
+    styleNotes: mood,
+    history: [
+      ...project.brief.history,
+      { role: "assistant" as const, content, ts: new Date().toISOString() },
+    ],
+  };
+}
+
+function summarizeArt(plan: ArtPlan): PlanSummary {
+  return {
+    kind: "art",
+    title: plan.title,
+    palette: plan.styleGuide.palette,
+    mood: plan.styleGuide.mood,
+    imagePrompt: plan.imagePrompt,
+  };
+}
+
+function summarizeDocument(plan: DocumentPlan): PlanSummary {
+  return {
+    kind: "document",
+    title: plan.title,
+    palette: plan.styleGuide.palette,
+    mood: plan.styleGuide.mood,
+    blockCount: plan.blocks.length,
+  };
+}
+
+function status(
+  writer: UIMessageStreamWriter<PosterUIMessage>,
+  phase: "planning" | "generating-assets" | "composing" | "saving" | "done",
+  note?: string,
+) {
+  writer.write({ type: "data-status", id: "status", data: { phase, note } });
 }

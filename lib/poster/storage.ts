@@ -1,5 +1,6 @@
 import { put, head, list, BlobNotFoundError } from "@vercel/blob";
 import type { PosterProject, ProjectIndexEntry, ProjectId } from "./types";
+import { normalizeProject } from "./migrate";
 
 const PROJECT_KEY = (id: ProjectId) => `projects/${id}/project.json`;
 const ASSETS_PREFIX = (id: ProjectId) => `projects/${id}/assets/`;
@@ -12,12 +13,27 @@ const PUT_OPTS = {
   allowOverwrite: true,
 };
 
+/**
+ * Defeat the CDN cache on mutable JSON reads.
+ *
+ * Blob clamps `cacheControlMaxAge: 0` up to `max-age=60`, so a blob URL can
+ * serve content up to a minute old. That was observed in practice: the gallery
+ * displayed a title that had already been overwritten. A unique query string
+ * makes each read a distinct cache key, so we always reach the origin.
+ *
+ * This applies to project state only, never to assets or exports — those are
+ * immutable once written and should stay cacheable.
+ */
+function fresh(url: string): string {
+  return `${url}${url.includes("?") ? "&" : "?"}_=${Date.now()}`;
+}
+
 export async function readProject(id: ProjectId): Promise<PosterProject | null> {
   try {
     const meta = await head(PROJECT_KEY(id));
-    const res = await fetch(meta.url, { cache: "no-store" });
+    const res = await fetch(fresh(meta.url), { cache: "no-store" });
     if (!res.ok) return null;
-    return (await res.json()) as PosterProject;
+    return normalizeProject(await res.json());
   } catch (err) {
     if (err instanceof BlobNotFoundError) return null;
     throw err;
@@ -74,7 +90,7 @@ export async function uploadExport(
 export async function readIndex(): Promise<ProjectIndexEntry[]> {
   try {
     const meta = await head(INDEX_KEY);
-    const res = await fetch(meta.url, { cache: "no-store" });
+    const res = await fetch(fresh(meta.url), { cache: "no-store" });
     if (!res.ok) return [];
     return (await res.json()) as ProjectIndexEntry[];
   } catch (err) {
@@ -101,4 +117,46 @@ export async function upsertIndexEntry(entry: ProjectIndexEntry): Promise<void> 
 export async function listProjectAssets(id: ProjectId) {
   const result = await list({ prefix: ASSETS_PREFIX(id) });
   return result.blobs;
+}
+
+/** Cap parallel blob reads so a big library doesn't open dozens of sockets. */
+const LIST_CONCURRENCY = 8;
+
+/**
+ * Load every project in full, newest first.
+ *
+ * The gallery renders real posters at their true aspect ratios, which needs
+ * layout and assets — not just the title in `_index.json`. Reading each
+ * project.json directly also means titles are always current, since it does not
+ * depend on the mutable index blob staying in sync.
+ *
+ * A project whose blob is missing or unparseable is skipped rather than taking
+ * the whole gallery down with it.
+ */
+export async function listProjects(): Promise<PosterProject[]> {
+  const { blobs } = await list({ prefix: "projects/" });
+  const targets = blobs.filter((b) => b.pathname.endsWith("/project.json"));
+
+  const loaded: PosterProject[] = [];
+  const queue = [...targets];
+
+  async function worker() {
+    while (queue.length > 0) {
+      const blob = queue.shift();
+      if (!blob) return;
+      try {
+        const res = await fetch(fresh(blob.url), { cache: "no-store" });
+        if (!res.ok) continue;
+        loaded.push(normalizeProject(await res.json()));
+      } catch (err) {
+        console.error(`Skipping unreadable project ${blob.pathname}:`, err);
+      }
+    }
+  }
+
+  await Promise.all(
+    Array.from({ length: Math.min(LIST_CONCURRENCY, targets.length) }, worker),
+  );
+
+  return loaded.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
 }
