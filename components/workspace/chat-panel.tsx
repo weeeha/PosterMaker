@@ -9,22 +9,24 @@ import { Textarea } from "@/components/ui/textarea";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import type { PosterUIMessage, PosterDataParts } from "@/lib/ai/messages";
+import type { PosterIntent } from "@/lib/poster/types";
 import type { ProjectUpdater } from "./workspace-shell";
 
 interface ChatPanelProps {
   projectId: string;
+  intent: PosterIntent;
   onUpdate: ProjectUpdater;
 }
 
 const PHASE_LABELS: Record<PosterDataParts["status"]["phase"], string> = {
-  planning: "Planning layout",
-  "generating-assets": "Generating illustrations",
+  planning: "Planning",
+  "generating-assets": "Generating imagery",
   composing: "Composing layout",
   saving: "Saving project",
   done: "Done",
 };
 
-export function ChatPanel({ projectId, onUpdate }: ChatPanelProps) {
+export function ChatPanel({ projectId, intent, onUpdate }: ChatPanelProps) {
   const [input, setInput] = useState("");
   const [phase, setPhase] = useState<PosterDataParts["status"]["phase"] | null>(null);
   const [phaseNote, setPhaseNote] = useState<string | undefined>(undefined);
@@ -54,16 +56,12 @@ export function ChatPanel({ projectId, onUpdate }: ChatPanelProps) {
             : { ...p, assets: [...p.assets, incoming] },
         );
       } else if (part.type === "data-layout") {
-        const { layout, palette, background, title } = part.data;
+        const { layout, canvas, title } = part.data;
         onUpdate((p) => ({
           ...p,
           title: title || p.title,
           layout,
-          canvas: {
-            ...p.canvas,
-            palette,
-            background: { kind: "solid", color: background },
-          },
+          canvas,
         }));
       } else if (part.type === "data-error") {
         setErrorBanner(part.data.message);
@@ -93,7 +91,7 @@ export function ChatPanel({ projectId, onUpdate }: ChatPanelProps) {
       <ScrollArea className="flex-1">
         <div ref={scrollRef} className="flex flex-col gap-4 px-4 py-4">
           {messages.length === 0 ? (
-            <Empty />
+            <Empty intent={intent} />
           ) : (
             messages.map((m) => <MessageBubble key={m.id} message={m} />)
           )}
@@ -141,7 +139,11 @@ export function ChatPanel({ projectId, onUpdate }: ChatPanelProps) {
         <Textarea
           value={input}
           onChange={(e) => setInput(e.target.value)}
-          placeholder="Describe the poster you want…"
+          placeholder={
+            intent === "art"
+              ? "Describe the artwork you want…"
+              : "Describe the document you want…"
+          }
           rows={3}
           disabled={isBusy}
           onKeyDown={(e) => {
@@ -170,26 +172,39 @@ export function ChatPanel({ projectId, onUpdate }: ChatPanelProps) {
   );
 }
 
-function Empty() {
+const EXAMPLES: Record<PosterIntent, { lead: string; items: string[]; note: string }> = {
+  document: {
+    lead: "Describe the document to lay out.",
+    items: [
+      "“Reference card for Vim shortcuts, organized by category, light background.”",
+      "“Macronutrients in 30 common foods as a dense table.”",
+      "“One-page onboarding overview for a design system: tokens, components, dos and don'ts.”",
+    ],
+    note: "Type and tables print as sharp vector at any size — resolution is never the limit here.",
+  },
+  art: {
+    lead: "Describe the artwork.",
+    items: [
+      "“Bauhaus geometric composition, rust and cream, bold diagonals.”",
+      "“Risograph-style mountain range at dusk, three ink colors, heavy grain.”",
+      "“Botanical study of monstera leaves, muted sage, fine line work.”",
+    ],
+    note: "One image is generated at the sheet's exact aspect. Check the print-resolution panel before printing large.",
+  },
+};
+
+function Empty({ intent }: { intent: PosterIntent }) {
+  const { lead, items, note } = EXAMPLES[intent];
   return (
     <div className="text-muted-foreground space-y-3 text-sm">
-      <p className="text-foreground font-medium">Describe a poster to start.</p>
+      <p className="text-foreground font-medium">{lead}</p>
       <p>Examples:</p>
       <ul className="ml-4 list-disc space-y-1 text-xs">
-        <li>
-          “Reference card for Vim shortcuts, black background, white text, organized by
-          category.”
-        </li>
-        <li>“Minimalist poster for a coffee tasting flight, four origins.”</li>
-        <li>
-          “Knowledge poster: macronutrients in 30 common foods, dense table, light
-          background.”
-        </li>
+        {items.map((item) => (
+          <li key={item}>{item}</li>
+        ))}
       </ul>
-      <p className="text-[11px]">
-        v1 ships at <span className="font-mono">18×24in @ 300 DPI</span>. Knowledge
-        posters work best.
-      </p>
+      <p className="text-[11px] leading-relaxed">{note}</p>
     </div>
   );
 }
@@ -206,12 +221,28 @@ function MessageBubble({ message }: { message: PosterUIMessage }) {
         {message.parts.map((part, i) => {
           if (part.type === "text") return <span key={i}>{part.text}</span>;
           if (part.type === "data-plan") {
+            const { title, palette, imagePrompt, blockCount } = part.data.plan;
             return (
-              <div key={i} className="text-muted-foreground mt-1 text-[11px]">
-                Designed “{part.data.plan.title}” · palette{" "}
-                <span className="font-mono">
-                  {part.data.plan.styleGuide.palette.slice(0, 3).join(" ")}
-                </span>
+              <div key={i} className="text-muted-foreground mt-1 space-y-1 text-[11px]">
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <span>Designed “{title}”</span>
+                  {/* Keyed by index, not hex: a palette can legitimately repeat
+                      a color (e.g. the same cream as both background and accent). */}
+                  {palette.slice(0, 5).map((hex, swatch) => (
+                    <span
+                      key={swatch}
+                      title={hex}
+                      className="border-border inline-block size-3 rounded-sm border"
+                      style={{ backgroundColor: hex }}
+                    />
+                  ))}
+                  {blockCount !== undefined && <span>· {blockCount} blocks</span>}
+                </div>
+                {imagePrompt && (
+                  <p className="border-border/60 border-l-2 pl-2 italic leading-relaxed">
+                    {imagePrompt}
+                  </p>
+                )}
               </div>
             );
           }
@@ -224,8 +255,8 @@ function MessageBubble({ message }: { message: PosterUIMessage }) {
                   alt={part.data.role}
                   className="border-border h-20 w-20 rounded border object-cover"
                 />
-                <span className="text-muted-foreground mt-0.5 text-[10px]">
-                  {part.data.role}
+                <span className="text-muted-foreground mt-0.5 font-mono text-[10px]">
+                  {part.data.asset.widthPx}×{part.data.asset.heightPx}
                 </span>
               </div>
             );

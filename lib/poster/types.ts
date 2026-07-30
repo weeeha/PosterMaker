@@ -1,3 +1,12 @@
+import {
+  DEFAULT_MARGIN_IN,
+  DEFAULT_MEDIA_ID,
+  PRINTABLE_INSET_IN,
+  mediaDimensions,
+  mediaOrDefault,
+  type Orientation,
+} from "./media";
+
 export type Inches = number;
 export type CanvasFraction = number;
 export type ProjectId = string;
@@ -21,7 +30,14 @@ export interface Brief {
   history: ChatTurn[];
 }
 
-export type PosterIntent = "knowledge";
+/**
+ * The two things Nick actually makes:
+ * - "art"      — image-first. One generated image fills the sheet.
+ * - "document" — layout-first. Type, tables, diagrams. No image by default.
+ *
+ * These take different pipelines end to end, not just different prompts.
+ */
+export type PosterIntent = "art" | "document";
 
 export interface ChatTurn {
   role: "user" | "assistant";
@@ -29,12 +45,27 @@ export interface ChatTurn {
   ts: string;
 }
 
+/**
+ * The printed page.
+ *
+ * There is deliberately NO bleed here. The TC-21 cannot print inside its own
+ * 5 mm border and we do not trim afterwards, so the old bleed + crop-mark model
+ * described a press we don't own. `printableInsetIn` is a hard hardware limit;
+ * `marginIn` is the design margin we choose inside it.
+ *
+ * widthIn/heightIn are derived from mediaId + orientation and stored so that
+ * renderers and the planner never have to resolve the catalog themselves.
+ */
 export interface Canvas {
+  mediaId: string;
+  orientation: Orientation;
   widthIn: Inches;
   heightIn: Inches;
-  dpi: 300;
-  bleedIn: number;
-  safeAreaIn: number;
+  dpi: number;
+  /** Hardware-unreachable border, inches. Content here will not print. */
+  printableInsetIn: number;
+  /** Design breathing room measured inward from the printable edge. */
+  marginIn: number;
   background: { kind: "solid"; color: string };
   palette: string[];
 }
@@ -50,6 +81,14 @@ export interface Asset {
     prompt?: string;
     seed?: number;
     styleKey?: string;
+    /** What we asked the provider for — a "WxH" size or an aspect string. */
+    requestedSize?: string;
+    /**
+     * Whether widthPx/heightPx were decoded from the returned bytes or merely
+     * assumed from the request. Only "decoded" values are trustworthy for
+     * print-resolution warnings.
+     */
+    dimensionsSource?: "decoded" | "requested";
   };
   createdAt: string;
 }
@@ -103,25 +142,58 @@ export interface ProjectIndexEntry {
   thumbnailUrl?: string;
 }
 
-export const DEFAULT_CANVAS: Canvas = {
-  widthIn: 18,
-  heightIn: 24,
-  dpi: 300,
-  bleedIn: 0.125,
-  safeAreaIn: 0.25,
-  background: { kind: "solid", color: "#000000" },
-  palette: ["#000000", "#ffffff"],
-};
+/**
+ * Default canvas: 18×24 portrait on the 24" roll (driver preset 609.60 × 457.20).
+ *
+ * Background defaults to near-white on purpose. The TC-21 is a 4-ink CMYK
+ * pigment machine with no photo black; a full-sheet solid black is slow, drinks
+ * ink, and bronzes or bands on plain paper. Dark backgrounds are opt-in.
+ */
+export function defaultCanvas(): Canvas {
+  const media = mediaOrDefault(DEFAULT_MEDIA_ID);
+  const { widthIn, heightIn } = mediaDimensions(media, "portrait");
+  return {
+    mediaId: media.id,
+    orientation: "portrait",
+    widthIn,
+    heightIn,
+    dpi: 300,
+    printableInsetIn: PRINTABLE_INSET_IN,
+    marginIn: DEFAULT_MARGIN_IN,
+    background: { kind: "solid", color: "#fbfaf7" },
+    palette: ["#fbfaf7", "#141414"],
+  };
+}
 
-export function emptyProject(id: ProjectId, title: string): PosterProject {
+export function canvasForMedia(
+  mediaId: string,
+  orientation: Orientation,
+  base?: Canvas,
+): Canvas {
+  const media = mediaOrDefault(mediaId);
+  const { widthIn, heightIn } = mediaDimensions(media, orientation);
+  return {
+    ...(base ?? defaultCanvas()),
+    mediaId: media.id,
+    orientation,
+    widthIn,
+    heightIn,
+  };
+}
+
+export function emptyProject(
+  id: ProjectId,
+  title: string,
+  intent: PosterIntent = "document",
+): PosterProject {
   const now = new Date().toISOString();
   return {
     id,
     title,
     createdAt: now,
     updatedAt: now,
-    brief: { prompt: "", intent: "knowledge", referenceUrls: [], history: [] },
-    canvas: { ...DEFAULT_CANVAS },
+    brief: { prompt: "", intent, referenceUrls: [], history: [] },
+    canvas: defaultCanvas(),
     assets: [],
     layout: { blocks: [], layoutVersion: now },
   };

@@ -71,7 +71,34 @@ export async function POST(req: Request) {
       height: viewport.height,
       deviceScaleFactor: viewport.deviceScaleFactor,
     });
+
+    // This deployment fetches its own preview page, so Vercel's deployment
+    // protection applies to the headless browser too — it is not logged in.
+    // With Protection Bypass for Automation enabled, this header gets us
+    // through; without it, the browser lands on the SSO login page and we would
+    // otherwise silently render THAT into the PDF.
+    const bypass = process.env.VERCEL_AUTOMATION_BYPASS_SECRET;
+    if (bypass) {
+      await tab.setExtraHTTPHeaders({
+        "x-vercel-protection-bypass": bypass,
+        "x-vercel-set-bypass-cookie": "true",
+      });
+    }
+
     await tab.goto(previewUrl, { waitUntil: "networkidle0", timeout: 120_000 });
+
+    // Confirm we actually rendered a poster rather than an auth wall or an error
+    // page. Cheap check, and it turns a corrupt-looking PDF into a clear cause.
+    const rendered = await tab.$("[data-poster-id]");
+    if (!rendered) {
+      throw new Error(
+        bypass
+          ? `Preview page did not render a poster at ${previewUrl}. The bypass secret may be stale.`
+          : "Puppeteer could not reach the preview page — it was blocked by Vercel deployment protection. " +
+            "Enable Protection Bypass for Automation in the project settings (this route already sends the header " +
+            "when VERCEL_AUTOMATION_BYPASS_SECRET is present), or turn off Vercel Authentication for this project.",
+      );
+    }
     const pdfBuffer = await tab.pdf({
       width: `${page.widthIn}in`,
       height: `${page.heightIn}in`,
