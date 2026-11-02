@@ -1,5 +1,13 @@
 # PosterMaker
 
+**Problem.** A poster that looks fine on screen can print wrong (bleed, DPI, colour), and the target here is a Canon imagePROGRAF TC-21 with a 24-inch roll and cut sheets.
+
+**Idea.** A planner and orchestrator lay out a poster from a text brief and generate its assets, print-readiness checks list problems before export, and the result exports as a PDF sized for the printer.
+
+**Built.** A Next.js 16 app using the Vercel AI SDK through the AI Gateway (Claude Sonnet 4.6 plans, GPT Image 2 makes art) with headless Chromium for PDF export, live at https://poster-maker-beta.vercel.app. Lenticular print output is spec only so far. 11 commits on 8 days, Apr 27 to Oct 25, 2026.
+
+**Decision.** Art and document posters run as two pipelines with their own print-readiness rules instead of one shared path. Art is one generated image at the sheet's exact aspect ratio, and document posters render type and tables as vector.
+
 AI poster generation for print. A planner and orchestrator lay out a poster from a text brief, generate its assets, and export a print-ready PDF sized for the Canon imagePROGRAF TC-21 (24-inch roll and cut sheets).
 
 ![Poster gallery with an art poster, a document poster and an empty project](docs/screenshots/overview.webp)
